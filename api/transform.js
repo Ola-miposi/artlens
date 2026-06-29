@@ -1,20 +1,7 @@
-/**
- * ArtLens proxy — Vercel Serverless Function
- * --------------------------------------------
- * Forwards requests from the ArtLens HTML page to the Anthropic API,
- * attaching your API key server-side so it's never exposed in the
- * page's source code.
- *
- * This file lives at: api/transform.js
- * Once deployed on Vercel, it becomes available at:
- *   https://YOUR-PROJECT-NAME.vercel.app/api/transform
- */
-
-const ANTHROPIC_VERSION = '2023-06-01';
-const ALLOWED_ORIGIN = '*'; // tighten this to your domain once you have one
+const ALLOWED_ORIGIN = '*';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 export default async function handler(req, res) {
-  // CORS headers on every response
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -27,26 +14,66 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: { message: 'Method not allowed' } });
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({
-      error: { message: 'Server is missing ANTHROPIC_API_KEY. Set it in Vercel → Project → Settings → Environment Variables.' },
+      error: { message: 'Server is missing GEMINI_API_KEY. Set it in Vercel → Project → Settings → Environment Variables.' },
     });
   }
 
   try {
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify(req.body),
-    });
+    const body = req.body || {};
+    const messageContent = body.messages?.[0]?.content || [];
+
+    const imageBlock = messageContent.find((b) => b.type === 'image');
+    const textBlock = messageContent.find((b) => b.type === 'text');
+
+    if (!imageBlock || !textBlock) {
+      return res.status(400).json({ error: { message: 'Request must include one image block and one text block.' } });
+    }
+
+    const geminiBody = {
+      contents: [
+        {
+          parts: [
+            {
+              inline_data: {
+                mime_type: imageBlock.source.media_type,
+                data: imageBlock.source.data,
+              },
+            },
+            { text: textBlock.text },
+          ],
+        },
+      ],
+    };
+
+    const upstream = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(geminiBody),
+      }
+    );
 
     const data = await upstream.json();
-    return res.status(upstream.status).json(data);
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ error: { message: data.error?.message || 'Gemini API request failed' } });
+    }
+
+    const text =
+      data.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || '')
+        .join(' ')
+        .trim() || '';
+
+    if (!text) {
+      return res.status(502).json({ error: { message: 'Gemini returned no text. The image or prompt may have been blocked by safety filters.' } });
+    }
+
+    return res.status(200).json({ content: [{ type: 'text', text }] });
   } catch (err) {
     return res.status(502).json({ error: { message: 'Upstream request failed: ' + err.message } });
   }
-      }
+  }
